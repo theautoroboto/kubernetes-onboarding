@@ -1,0 +1,24 @@
+foundation:
+  name: 
+  docker_registry: 
+  smtp_host: 
+  grafana_url: 
+  grafana_key: 
+
+pipelines:
+  pks_cluster_git: 
+  email-from: 
+  email-to: 
+
+secrets:
+  concourse:
+    git:
+      username: 
+      password: 
+
+
+pks:
+  pks_automation:
+    username: 
+    password: 
+  api: 

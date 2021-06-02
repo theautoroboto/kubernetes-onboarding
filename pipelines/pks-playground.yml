@@ -1,0 +1,637 @@
+resource_types:
+- name: email
+  type: docker-image
+  source:
+    repository: ((foundation.docker_registry))/pcf-admins/email-resource
+    insecure_registries: [ ((foundation.docker_registry)) ]
+
+resources:
+- name: pks-cluster-repo
+  type: git
+  source:
+    uri: ((pipelines.pks_cluster_git))
+    username: ((secrets.concourse.git_username))
+    password: ((secrets.concourse.git_password))
+    # private_key: ((secrets.concourse.git_ssh_prvkey))
+    skip_ssl_verification: true
+    paths: [ pksfog/cluster.json ]
+
+- name: send-an-email
+  type: email
+  source:
+    smtp:
+      host: ((foundation.smtp_host))
+      port: "25"
+      skip_ssl_validation: true
+      anonymous: true
+    from: ((pipelines.email-from))
+    bcc: [ ((pipelines.email-to)) ]
+
+- name: pks-playground-repo
+  type: git
+  source:
+    uri: ((pipelines.pks_cluster_git))
+    username: ((secrets.concourse.git_username))
+    password: ((secrets.concourse.git_password))
+    # private_key: ((secrets.concourse.git_ssh_prvkey))
+    skip_ssl_verification: true
+    branch: master
+    paths: [ pksfog/playground.json ]
+
+- name: pks-tester
+  type: docker-image
+  source:
+    repository: ((foundation.docker_registry))/pcf-admins/pkstester
+
+- name: delete-schedule
+  type: time
+  source:
+    start: 9:00 PM
+    stop: 8:00 PM
+    location: America/New_York
+    interval: 24h
+
+jobs:
+- name: pks-long-term-onboarding
+  plan:
+  - get: pks-cluster-repo
+    trigger: true
+  - get: pks-tester
+  - task: pks-create-cluster
+    image: pks-tester
+    params:
+      PKS_API: ((pks.api))                                            #From param file
+      AUTOMATION_CLIENT: ((pks.pks_automation.username))              #Credhub-From param file
+      PKS_USER_PASSWORD: ((pks.pks_automation.password))              #CredHub=From param file
+      PKS_ENV: ((foundation.name))
+      GRAFANA_URL: ((foundation.grafana_url))
+      API_TOKEN: ((foundation.grafana_key))
+    config:
+      platform: linux
+      inputs:
+        - name: pks-cluster-repo
+      outputs:
+        - name: email
+      run:
+        path: bash
+        args:
+        - -c
+        - |
+          set -eu
+          echo "original no_proxy is $no_proxy"
+          no_proxy=$PKS_API,$GRAFANA_URL,$no_proxy
+          export no_proxy
+          echo "no_proxy is now $no_proxy"
+          echo "Adding helm repo"
+          helm repo add stable https://kubernetes-charts.storage.googleapis.com
+          echo "Done adding helm repo"
+          helm repo update
+
+          #EMail
+          cat > email/headers.txt <<EOH
+          MIME-version: 1.0
+          Content-Type: text/html; charset="UTF-8"
+          EOH
+
+          # login to PKS
+          echo "Logging in..."
+          pks login -a ${PKS_API} -u ${AUTOMATION_CLIENT} -p ${PKS_USER_PASSWORD} -k
+
+          LOGIN_EXIT_CODE=$(echo $?)
+          if [[ $LOGIN_EXIT_CODE -ne 0 ]]; then
+              echo "FAILED: Cannot login"
+              exit 1
+          fi
+
+          #Read in json,  Check if cluster is there, if yes, exit.  If not create
+          cluster_json=$(cat pks-cluster-repo/${PKS_ENV}/cluster.json)
+          pks_clusters=$(pks clusters --json)
+
+          for row in $(echo "${cluster_json}" | jq -r '.clusters[] | @base64'); do
+              _jq() {
+              echo ${row} | base64 --decode | jq -r ${1}
+              }
+            echo $(_jq '.clusterName')
+            PKS_REQUESTER_EMAIL=$(_jq '.email')
+            printf ${PKS_REQUESTER_EMAIL} > email/to.txt
+            PKS_CLUSTER_NAME=$(_jq '.clusterName')
+            PKS_REQUESTER=$(_jq '.userName')
+            printf "${PKS_CLUSTER_NAME} failed to create" > email/subject.txt
+            # printf "${PKS_REQUESTER}, it saddens me to report your cluster ${PKS_CLUSTER_NAME} failed to create."  >  email/body.html
+
+            pks_clusters=$(pks clusters --json | jq --arg NAME "${PKS_CLUSTER_NAME}" '.[] | select(.name | contains($NAME))')
+            if [ -z "$pks_clusters" ]
+            then
+              echo "Ready to go"
+              PKS_CLUSTER_HOSTNAME=$(_jq '.clusterName').pksfog.xxx.net
+              PKS_PLAN_NAME=$(_jq '.plan')
+              echo "Creating a new cluster"
+              echo "REQUESTER:  ${PKS_REQUESTER}"
+              echo "EMAIL:      ${PKS_REQUESTER_EMAIL}"
+              echo "NAME:       ${PKS_CLUSTER_NAME}"
+              echo "HOST_NAME:  ${PKS_CLUSTER_HOSTNAME}"
+              echo "PLAN_NAME:  ${PKS_PLAN_NAME}"
+              cluster_result=$(pks create-cluster ${PKS_CLUSTER_NAME} -e ${PKS_CLUSTER_HOSTNAME} -p ${PKS_PLAN_NAME} --wait)
+
+              echo "getting kube config"
+              pks get-kubeconfig ${PKS_CLUSTER_NAME} -a ${PKS_API} -u ${AUTOMATION_CLIENT} -p ${PKS_USER_PASSWORD} -k
+
+              echo "getting cluster IP"
+              pks get-credentials ${PKS_CLUSTER_NAME}
+              CLUSTER_IP=$(pks cluster ${PKS_CLUSTER_NAME} --json | jq -r '.kubernetes_master_ips[]')
+              CLUSTER_HOSTNAME=$(pks cluster ${PKS_CLUSTER_NAME} --json | jq -r '.parameters.kubernetes_master_host')
+              sed -i "s/server:\ https:\/\/$CLUSTER_HOSTNAME/server:\ https:\/\/$CLUSTER_IP/g" ~/.kube/config
+              echo "Cluster IP $CLUSTER_IP to be added to no_proxy for the cluster name:: $PKS_CLUSTER_NAME"
+              no_proxy=$CLUSTER_IP,$no_proxy
+              export no_proxy
+
+          cat <<EOH >> cluster-admin.yml
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: clustermanager-binding
+          subjects:
+          - kind: User
+            name: ${PKS_REQUESTER}
+            apiGroup: rbac.authorization.k8s.io
+          roleRef:
+            kind: ClusterRole
+            name: cluster-manager
+            apiGroup: rbac.authorization.k8s.io
+          EOH
+
+              echo "setting customer admin role"
+              kubectl create -f cluster-admin.yml
+
+              kubectl create ns monitoring
+              kubectl create -f pks-cluster-repo/${PKS_ENV}/storage-class.yml
+
+          kubectl apply -f - <<EOF
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: cluster-developer-binding
+            namespace: monitoring
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-developer
+          subjects:
+            - kind: ServiceAccount
+              name: prometheus-operator-operator
+              namespace: monitoring
+          EOF
+
+          kubectl apply -f - <<EOF
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: service-account-psp-restricted-binding
+            namespace: monitoring
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: developer-psp-restricted
+          subjects:
+            - kind: ServiceAccount
+              name: prometheus-operator-prometheus
+              namespace: monitoring
+            - kind: ServiceAccount
+              name: prometheus-operator-admission
+              namespace: monitoring
+            - kind: ServiceAccount
+              name: prometheus-operator-grafana
+              namespace: monitoring
+            - kind: ServiceAccount
+              name: prometheus-operator-operator
+              namespace: monitoring
+          EOF
+            echo "running helm"
+            helm upgrade prometheus-operator -i \
+              -f pks-cluster-repo/${PKS_ENV}/values-prometheus.yml \
+              --namespace monitoring \
+              --set grafana.service.type=LoadBalancer \
+              --set grafana.enabled=true \
+              --set grafana.adminPassword=RandomP@55w0rd \
+              --set global.rbac.pspEnabled=false \
+              --set grafana.testFramework.enabled=false \
+              --set alertmanager.enabled=false \
+              --set prometheus.service.type=LoadBalancer \
+              --set kubeTargetVersionOverride="$(kubectl version --short | grep -i server | awk '{print $3}' |  cut -c2-1000)" \
+              stable/prometheus-operator
+            load_balancer_ip=$(kubectl get svc -n monitoring prometheus-operator-prometheus -o json | jq -r '.status.loadBalancer.ingress[].ip')
+
+            #Grafana API
+            if [[ -z "$load_balancer_ip" || -z "$GRAFANA_URL" || -z "$API_TOKEN" ]]; then
+              echo "USAGE: $0 <load_balancer_ip> <GRAFANA_URL> <API_TOKEN>"
+              exit 1
+            fi
+
+            CLUSTER_PROMETHEUS_URL="$(kubectl get services --namespace monitoring | grep -e 'operator-prometheus.*LoadBalancer' | awk '{print $4}')"
+            CLUSTER_PROMETHEUS_PORT="9090"
+
+            if [[ -n "$CLUSTER_PROMETHEUS_URL" ]]; then
+              datasource="{
+                \"Id\": 1,
+                \"OrgId\": 1,
+                \"Name\": \"Cluster-$CLUSTER_NAME\",
+                \"Type\": \"prometheus\",
+                \"Access\": \"proxy\",
+                \"Url\": \"http://$CLUSTER_PROMETHEUS_URL:$CLUSTER_PROMETHEUS_PORT\",
+                \"Password\": \"\",
+                \"User\": \"\",
+                \"Database\": \"\",
+                \"BasicAuth\": false,
+                \"IsDefault\": false,
+                \"JsonData\": {},
+                \"ReadOnly\": true
+              }"
+
+              curl -k -H "Content-Type: application/json" -H "Authorization: Bearer $API_TOKEN" $GRAFANA_URL/api/datasources -X POST -d "$datasource"
+            else
+              echo "Unable to get the target cluster prometheus URL"
+              exit 1
+            fi
+          #Begin the Email Body
+          cat > email/body.html <<EOH
+          <html>
+          <style>
+          table, th, td {
+              border: 1px solid black;
+          }
+          </style>
+          <body>
+          <p>
+          <pre>
+          EOH
+
+              printf "${PKS_REQUESTER}, I'm happy to report you have a fresh cluster named ${PKS_CLUSTER_NAME}.  The userID ${PKS_REQUESTER} has been granted the Cluster Manager Role binding."  >>  email/body.html
+              printf "<h2><font face=Arial>PKS Cluster creation results</font></h2>${cluster_result} <hr>"  >>  email/body.html
+              echo "<h2><font face=Arial>Getting Started</font></h2>Please follow the getting started link: <a href='https://km..../Pages/Pivotal%20Container%20Service%20(PKS)%20-%20Cluster-Manager%20Getting%20Started%20Guide.aspx'>GETTING STARTED</a><hr>"  >>  email/body.html
+              printf "<hr>PKS Admins, please add http://${load_balancer_ip}:9090 as a new prometheus datasource"  >>  email/body.html
+              printf "${PKS_CLUSTER_NAME} successfully built" > email/subject.txt
+              printf "</table></body></html>" >> email/body.html
+            else
+              echo "clusterName already used"
+              printf "The name of your requested cluster is already in use" > email/subject.txt
+          #Begin the Email Body
+          cat > email/body.html <<EOH
+          <html>
+          <style>
+          table, th, td {
+              border: 1px solid black;
+          }
+          </style>
+          <body>
+          <p>
+          <pre>
+          EOH
+              printf "${PKS_REQUESTER}, it saddens me to report your cluster name ${PKS_CLUSTER_NAME} is already in use."  >  email/body.html
+              # printf "</table></body></html>" >> email/body.html
+            fi
+          done
+          pks logout
+
+    on_success:
+      put: send-an-email
+      params:
+        headers: email/headers.txt
+        subject: email/subject.txt
+        body: email/body.html
+        to: email/to.txt
+    on_failure:
+      put: send-an-email
+      params:
+        headers: email/headers.txt
+        subject: email/subject.txt
+        body: email/body.html
+        to: email/to.txt
+
+- name: create-playground
+  plan:
+  - get: pks-playground-repo
+    trigger: true
+  - get: pks-tester
+  - task: pks-create-cluster
+    image: pks-tester
+    params:
+      PKS_API: ((pks.api))                                            #From param file
+      AUTOMATION_CLIENT: ((pks.pks_automation.username))              #Credhub-From param file
+      PKS_USER_PASSWORD: ((pks.pks_automation.password))              #CredHub=From param file
+      PKS_ENV: ((foundation.name))
+    config:
+      platform: linux
+      inputs:
+        - name: pks-playground-repo
+      outputs:
+        - name: email
+      run:
+        path: bash
+        args:
+        - -c
+        - |
+          set -eu
+          no_proxy=$PKS_API,$no_proxy
+          export no_proxy
+          echo "no_proxy is $no_proxy"
+          echo "Adding helm repo"
+          helm repo add stable https://kubernetes-charts.storage.googleapis.com
+          echo "Done adding helm repo"
+          helm repo update
+          cluster_json=$(cat pks-playground-repo/${PKS_ENV}/playground.json)
+
+          #EMail
+          cat > email/headers.txt <<EOH
+          MIME-version: 1.0
+          Content-Type: text/html; charset="UTF-8"
+          EOH
+
+          # login to PKS
+          echo "Logging in..."
+          pks login -a ${PKS_API} -u ${AUTOMATION_CLIENT} -p ${PKS_USER_PASSWORD} -k
+
+          LOGIN_EXIT_CODE=$(echo $?)
+          if [[ $LOGIN_EXIT_CODE -ne 0 ]]; then
+              echo "FAILED: Cannot login"
+              exit 1
+          fi
+
+          #Read in json,  Check if cluster is there, if yes, exit.  If not create
+          pks_clusters=$(pks clusters --json)
+
+          for row in $(echo "${cluster_json}" | jq -r '.clusters[] | @base64'); do
+              _jq() {
+              echo ${row} | base64 --decode | jq -r ${1}
+              }
+            echo $(_jq '.clusterName')
+            PKS_REQUESTER_EMAIL=$(_jq '.email')
+            PKS_CLUSTER_NAME=$(_jq '.clusterName')
+            PKS_REQUESTER=$(_jq '.userName')
+            EXPIRE_DATE=$(_jq '.expiration')
+            printf ${PKS_REQUESTER_EMAIL} > email/to.txt
+            printf "${PKS_CLUSTER_NAME} failed to create" > email/subject.txt
+            # printf "${PKS_REQUESTER}, it saddens me to report your cluster ${PKS_CLUSTER_NAME} failed to create."  >  email/body.html
+
+            pks_clusters=$(pks clusters --json | jq --arg NAME "${PKS_CLUSTER_NAME}" '.[] | select(.name | contains($NAME))')
+            if [ -z "$pks_clusters" ]
+            then
+              echo "Ready to go"
+              PKS_CLUSTER_HOSTNAME=$(_jq '.clusterName').pksfog.xxx.net
+              PKS_PLAN_NAME=$(_jq '.plan')
+              echo "Creating a new cluster"
+              echo "REQUESTER:    ${PKS_REQUESTER}"
+              echo "EMAIL:        ${PKS_REQUESTER_EMAIL}"
+              echo "NAME:         ${PKS_CLUSTER_NAME}"
+              echo "HOST_NAME:    ${PKS_CLUSTER_HOSTNAME}"
+              echo "PLAN_NAME:    ${PKS_PLAN_NAME}"
+              echo "EXPIRE_DATE:  ${EXPIRE_DATE}"
+              cluster_result=$(pks create-cluster ${PKS_CLUSTER_NAME} -e ${PKS_CLUSTER_HOSTNAME} -p ${PKS_PLAN_NAME} --wait)
+
+              echo "getting kube config"
+              pks get-kubeconfig ${PKS_CLUSTER_NAME} -a ${PKS_API} -u ${AUTOMATION_CLIENT} -p ${PKS_USER_PASSWORD} -k
+
+              echo "getting cluster IP"
+              pks get-credentials ${PKS_CLUSTER_NAME}
+              CLUSTER_IP=$(pks cluster ${PKS_CLUSTER_NAME} --json | jq -r '.kubernetes_master_ips[]')
+              CLUSTER_HOSTNAME=$(pks cluster ${PKS_CLUSTER_NAME} --json | jq -r '.parameters.kubernetes_master_host')
+              sed -i "s/server:\ https:\/\/$CLUSTER_HOSTNAME/server:\ https:\/\/$CLUSTER_IP/g" ~/.kube/config
+              echo "Cluster IP $CLUSTER_IP to be added to no_proxy for the cluster name:: $PKS_CLUSTER_NAME"
+              no_proxy=$CLUSTER_IP,$no_proxy
+              export no_proxy
+
+          cat <<EOH >> cluster-admin.yml
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: clustermanager-binding
+          subjects:
+          - kind: User
+            name: ${PKS_REQUESTER}
+            apiGroup: rbac.authorization.k8s.io
+          roleRef:
+            kind: ClusterRole
+            name: cluster-manager
+            apiGroup: rbac.authorization.k8s.io
+          EOH
+
+              echo "setting customer admin role"
+              kubectl create -f cluster-admin.yml
+
+              kubectl create ns monitoring
+              kubectl create -f pks-playground-repo/${PKS_ENV}/storage-class.yml
+
+          kubectl apply -f - <<EOF
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: cluster-developer-binding
+            namespace: monitoring
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-developer
+          subjects:
+            - kind: ServiceAccount
+              name: prometheus-operator-operator
+              namespace: monitoring
+          EOF
+
+          kubectl apply -f - <<EOF
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: service-account-psp-restricted-binding
+            namespace: monitoring
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: developer-psp-restricted
+          subjects:
+            - kind: ServiceAccount
+              name: prometheus-operator-prometheus
+              namespace: monitoring
+            - kind: ServiceAccount
+              name: prometheus-operator-admission
+              namespace: monitoring
+            - kind: ServiceAccount
+              name: prometheus-operator-grafana
+              namespace: monitoring
+            - kind: ServiceAccount
+              name: prometheus-operator-operator
+              namespace: monitoring
+          EOF
+            echo "running helm"
+            helm upgrade prometheus-operator -i \
+              -f pks-playground-repo/${PKS_ENV}/values-prometheus.yml \
+              --namespace monitoring \
+              --set grafana.service.type=LoadBalancer \
+              --set grafana.enabled=true \
+              --set grafana.adminPassword=RandomP@55w0rd \
+              --set global.rbac.pspEnabled=false \
+              --set grafana.testFramework.enabled=false \
+              --set alertmanager.enabled=false \
+              --set prometheus.service.type=LoadBalancer \
+              --set kubeTargetVersionOverride="$(kubectl version --short | grep -i server | awk '{print $3}' |  cut -c2-1000)" \
+              stable/prometheus-operator
+            load_balancer_ip=$(kubectl get svc -n monitoring prometheus-operator-prometheus -o json | jq -r '.status.loadBalancer.ingress[].ip')
+
+          #Begin the Email Body
+          cat > email/body.html <<EOH
+          <html>
+          <style>
+          table, th, td {
+              border: 1px solid black;
+          }
+          </style>
+          <body>
+          <p>
+          <pre>
+          EOH
+
+              printf "${PKS_REQUESTER}, I'm happy to report you have a temporary fresh cluster named ${PKS_CLUSTER_NAME}.  The userID ${PKS_REQUESTER} has been granted the Cluster Manager Role binding.  Your cluster will be deleted on ${EXPIRE_DATE}"  >>  email/body.html
+              printf "<h2><font face=Arial>PKS Cluster creation results</font></h2>${cluster_result} <hr>"  >>  email/body.html
+              echo "<h2><font face=Arial>Getting Started</font></h2>Please follow the getting started link: <a href='https://km..../sites/cookbook/Pages/Pivotal%20Container%20Service%20(PKS)%20-%20Cluster-Manager%20Getting%20Started%20Guide.aspx'>GETTING STARTED</a><hr>"  >>  email/body.html
+              printf "<hr>PKS Admins, if you so desire, add http://${load_balancer_ip}:9090 as a new prometheus datasource"  >>  email/body.html
+              printf "${PKS_CLUSTER_NAME} successfully built" > email/subject.txt
+              printf "</table></body></html>" >> email/body.html
+            else
+              echo "clusterName already used or there is nothing new and delete playground happened"
+            fi
+          done
+          pks logout
+    on_success:
+      put: send-an-email
+      params:
+        headers: email/headers.txt
+        subject: email/subject.txt
+        body: email/body.html
+        to: email/to.txt
+    on_failure:
+      put: send-an-email
+      params:
+        headers: email/headers.txt
+        subject: email/subject.txt
+        body: email/body.html
+        to: email/to.txt
+
+- name: delete-playground
+  plan:
+  - get: delete-schedule
+    trigger: true
+  - get: pks-playground-repo
+  - get: pks-tester
+  - task: pks-delete-cluster
+    image: pks-tester
+    params:
+      PKS_API: ((pks.api))                                            #From param file
+      AUTOMATION_CLIENT: ((pks.pks_automation.username))              #Credhub-From param file
+      PKS_USER_PASSWORD: ((pks.pks_automation.password))              #CredHub=From param file
+      PKS_ENV: ((foundation.name))
+      GIT_USER: ((secrets.concourse.git_username))
+      GIT_PASSWORD: ((secrets.concourse.git_password))
+    config:
+      platform: linux
+      inputs:
+        - name: pks-playground-repo
+      outputs:
+        - name: email
+        - name: commit-repo
+      run:
+        path: bash
+        args:
+        - -c
+        - |
+          set -eu
+          unset http_proxy
+          unset https_proxy
+          #EMail
+          cat > email/headers.txt <<EOH
+          MIME-version: 1.0
+          Content-Type: text/html; charset="UTF-8"
+          EOH
+
+          # login to PKS
+          echo "Logging in..."
+          pks login -a ${PKS_API} -u ${AUTOMATION_CLIENT} -p ${PKS_USER_PASSWORD} -k
+
+          LOGIN_EXIT_CODE=$(echo $?)
+          if [[ $LOGIN_EXIT_CODE -ne 0 ]]; then
+              echo "FAILED: Cannot login"
+              exit 1
+          fi
+
+          cluster_json=$(cat pks-playground-repo/${PKS_ENV}/playground.json)
+          pks_clusters=$(pks clusters --json)
+          i=0
+          deletedIndexes=""
+          for row in $(echo "${cluster_json}" | jq -r '.clusters[] | @base64'); do
+              _jq() {
+              echo ${row} | base64 --decode | jq -r ${1}
+              }
+            PKS_REQUESTER=$(_jq '.userName')
+            PKS_REQUESTER_EMAIL=$(_jq '.email')
+            CLUSTER_NAME=$(_jq '.clusterName')
+            EXPIRE_DATE=$(date -d $(_jq '.expiration') +%s)
+            TODAY_DATE=$(date +%s)
+            echo "Expire Date: ${EXPIRE_DATE}"
+            echo "Today Date: ${TODAY_DATE}"
+            echo "ClusterName: "$(_jq '.clusterName')
+            if [[ $EXPIRE_DATE < $TODAY_DATE ]]
+            then
+              echo "DELETE ClusterName::: "${CLUSTER_NAME}
+              #Delete Cluster
+              pks delete-cluster ${CLUSTER_NAME} --wait --non-interactive
+              if [ -z "$deletedIndexes" ]; then
+                deletedIndexes=$i
+              else
+                deletedIndexes=$i,$deletedIndexes
+              fi
+            else
+              echo "Cluster is all good::: "$(_jq '.clusterName')
+            fi
+            i=$((i+1))
+          done
+
+          for s in $(echo "$deletedIndexes" | tr "," "\n")
+          do
+            cluster_json=$(echo "$cluster_json" | jq --arg index $s 'del(.clusters[$index | tonumber])')
+          done
+          echo $cluster_json
+          
+          echo "Commit and git push for user::" $GIT_USER
+          # git config --global credential.helper cache
+          # git config --global credential.helper 'cache --timeout=3600'
+          git config --global user.email "Concourse@xxx.com"
+          git config --global user.name $GIT_USER
+          # git config http.sslVerify false
+          git clone pks-playground-repo commit-repo
+
+          echo $cluster_json > commit-repo/${PKS_ENV}/playground.json
+          cd commit-repo
+          DIFF=$(git diff-index HEAD)
+          if [[ "$DIFF" != "" ]]; then
+            git add -A
+            git commit -m "A Cluster has been deleted"
+            # git push
+          else
+              echo "no changes"
+          fi
+
+          pks logout
+    # on_success:
+    #   put: send-an-email
+    #   params:
+    #     headers: email/headers.txt
+    #     subject: email/subject.txt
+    #     body: email/body.html
+    #     to: email/to.txt
+
+    # on_failure:
+    #   put: send-an-email
+    #   params:
+    #     headers: email/headers.txt
+    #     subject: email/subject.txt
+    #     body: email/body.html
+    #     to: email/to.txt
+  - put: pks-playground-repo
+    params: {repository: commit-repo}

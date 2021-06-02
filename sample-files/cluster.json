@@ -1,0 +1,9 @@
+{"clusters": [
+    {
+        "clusterName": "long-term-cluster",
+        "plan": "small",
+        "userName": "someuserID",
+        "email": "someemail@somedomain.com",
+        "description": "This is my cluster"
+    }
+]}

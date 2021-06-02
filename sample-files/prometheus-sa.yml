@@ -1,0 +1,22 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: service-account-psp-restricted-binding
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: developer-psp-restricted
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-operator-prometheus
+    namespace: monitoring
+  - kind: ServiceAccount
+    name: prometheus-operator-admission
+    namespace: monitoring
+  - kind: ServiceAccount
+    name: prometheus-operator-grafana
+    namespace: monitoring
+  - kind: ServiceAccount
+    name: prometheus-operator-operator
+    namespace: monitoring

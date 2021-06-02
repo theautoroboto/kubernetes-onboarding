@@ -1,0 +1,44 @@
+{
+    "clusters": [ 
+    {
+        "clusterName": "thebob",
+        "plan": "small",
+        "userName": "someuserID",
+        "email": "someemail@somedomain.com",
+        "description": "Hi, I'm with platform team",
+        "expiration": "02/06/2020"
+    }, 
+    {
+        "clusterName": "pkstester",
+        "plan": "small",
+        "userName":"someuserID",
+        "email": "someemail@somedomain.com",
+        "description": "This is my cluster",
+        "expiration": "02/05/2020"
+    },
+    {
+        "clusterName": "pkstester-new",
+        "plan": "small",
+        "userName": "someuserID",
+        "email": "someemail@somedoamin.com",
+        "description": "This is my cluster",
+        "expiration": "02/05/2020"
+    },
+    {
+        "clusterName": "pkstester-anothernew",
+        "plan": "small",
+        "userName": "someuserID",
+        "email": "someemail@somedomain.com",
+        "description": "This is my cluster",
+        "expiration": "02/05/2020"
+    },
+    {
+        "clusterName": "anothercluster",
+        "plan": "small",
+        "userName": "someuserID",
+        "email": "someemail@somedomain.com",
+        "description": "This is my cluster",
+        "expiration": "02/05/2020"
+    }
+    ]
+}

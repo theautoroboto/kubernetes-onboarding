@@ -1,0 +1,186 @@
+---
+resource_types:
+- name: email
+  type: docker-image
+  source:
+    repository: ((foundation.docker_registry))/pcf-admins/email-resource
+    insecure_registries: [ ((foundation.docker_registry)) ]
+
+resources:
+- name: pks-cluster-repo
+  type: git
+  source:
+    uri: ((pipelines.pks_cluster_git))
+    username: ((secrets.concourse.git.username))
+    password: ((secrets.concourse.git.password))
+    # private_key: ((secrets.concourse.git.ssh_prvkey))
+    skip_ssl_verification: true
+    paths: [ ((foundation.name))/cluster.json ]
+- name: send-an-email
+  type: email
+  source:
+    smtp:
+      host: ((foundation.smtp_host))
+      port: "25"
+      skip_ssl_validation: true
+      anonymous: true
+    from: ((pipelines.email-from))
+    bcc: [ ((pipelines.email-to)) ]
+
+- name: pks-tester
+  type: docker-image
+  source:
+    repository: ((foundation.docker_registry))/pcf-admins/pkstester
+
+jobs:
+- name: pks-long-term-onboarding
+  plan:
+  - get: pks-cluster-repo
+    trigger: true
+  - get: pks-tester
+  - task: pks-create-cluster
+    image: pks-tester
+    params:
+      PKS_API: ((pks.api))                                            #From param file
+      AUTOMATION_CLIENT: ((pks.pks_automation.username))              #Credhub-From param file
+      PKS_USER_PASSWORD: ((pks.pks_automation.password))              #CredHub=From param file
+      PKS_ENV: ((foundation.name))                                    #From param file
+    config:
+      platform: linux
+      inputs:
+        - name: pks-cluster-repo
+      outputs:
+        - name: email
+      run:
+        args:
+        - -c
+        - |
+          set -eu
+          unset http_proxy
+          unset https_proxy
+          #EMail
+          cat > email/headers.txt <<EOH
+          MIME-version: 1.0
+          Content-Type: text/html; charset="UTF-8"
+          EOH
+
+          # login to PKS
+          echo "Logging in..."
+          pks login -a ${PKS_API} -u ${AUTOMATION_CLIENT} -p ${PKS_USER_PASSWORD} -k
+
+          LOGIN_EXIT_CODE=$(echo $?)
+          if [[ $LOGIN_EXIT_CODE -ne 0 ]]; then
+              echo "FAILED: Cannot login"
+              exit 1
+          fi
+
+          #Read in json,  Check if cluster is there, if yes, exit.  If not create
+          cluster_json=$(cat pks-cluster-repo/${PKS_ENV}/cluster.json)
+          pks_clusters=$(pks clusters --json)
+
+          for row in $(echo "${cluster_json}" | jq -r '.clusters[] | @base64'); do
+              _jq() {
+              echo ${row} | base64 --decode | jq -r ${1}
+              }
+            echo $(_jq '.clusterName')
+            PKS_REQUESTER_EMAIL=$(_jq '.email')
+            printf ${PKS_REQUESTER_EMAIL} > email/to.txt
+            PKS_CLUSTER_NAME=$(_jq '.clusterName')
+            PKS_REQUESTER=$(_jq '.userName')
+            printf "${PKS_CLUSTER_NAME} failed to create" > email/subject.txt
+            # printf "${PKS_REQUESTER}, it saddens me to report your cluster ${PKS_CLUSTER_NAME} failed to create."  >  email/body.html
+
+            pks_clusters=$(pks clusters --json | jq --arg NAME "${PKS_CLUSTER_NAME}" '.[] | select(.name | contains($NAME))')
+            if [ -z "$pks_clusters" ]
+            then
+              echo "Ready to go"
+              PKS_CLUSTER_HOSTNAME=$(_jq '.clusterName').pksfog.xyz.net
+              PKS_PLAN_NAME=$(_jq '.plan')
+              echo "Creating a new cluster"
+              echo "REQUESTER:  ${PKS_REQUESTER}"
+              echo "EMAIL:      ${PKS_REQUESTER_EMAIL}"
+              echo "NAME:       ${PKS_CLUSTER_NAME}"
+              echo "HOST_NAME:  ${PKS_CLUSTER_HOSTNAME}"
+              echo "PLAN_NAME:  ${PKS_PLAN_NAME}"
+              cluster_result=$(pks create-cluster ${PKS_CLUSTER_NAME} -e ${PKS_CLUSTER_HOSTNAME} -p ${PKS_PLAN_NAME} --wait)
+
+              echo "getting kube config"
+              pks get-kubeconfig ${PKS_CLUSTER_NAME} -a ${PKS_API} -u ${AUTOMATION_CLIENT} -p ${PKS_USER_PASSWORD} -k
+
+              echo "getting cluster IP"
+              pks get-credentials ${PKS_CLUSTER_NAME}
+              CLUSTER_IP=$(pks cluster ${PKS_CLUSTER_NAME} --json | jq -r '.kubernetes_master_ips[]')
+              CLUSTER_HOSTNAME=$(pks cluster ${PKS_CLUSTER_NAME} --json | jq -r '.parameters.kubernetes_master_host')
+              sed -i "s/server:\ https:\/\/$CLUSTER_HOSTNAME/server:\ https:\/\/$CLUSTER_IP/g" ~/.kube/config
+
+          cat <<EOH >> cluster-admin.yml
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: clustermanager-binding
+          subjects:
+          - kind: User
+            name: ${PKS_REQUESTER}
+            apiGroup: rbac.authorization.k8s.io
+          roleRef:
+            kind: ClusterRole
+            name: cluster-manager
+            apiGroup: rbac.authorization.k8s.io
+          EOH
+
+              echo "setting customer admin role"
+              kubectl create -f cluster-admin.yml
+              # push an app?
+              # If we wanted, we could search LDAP and get their email address
+
+          #Begin the Email Body
+          cat > email/body.html <<EOH
+          <html>
+          <style>
+          table, th, td {
+              border: 1px solid black;
+          }
+          </style>
+          <body>
+          <p>
+          <pre>
+          EOH
+
+              printf "${PKS_REQUESTER}, I'm happy to report you have a fresh cluster named ${PKS_CLUSTER_NAME}.  The userID ${PKS_REQUESTER} has been granted the Cluster Manager Role binding."  >>  email/body.html
+              printf "<h2><font face=Arial>PKS Cluster creation results</font></h2>${cluster_result} <hr>"  >>  email/body.html
+              echo "<h2><font face=Arial>Getting Started</font></h2>Please follow the getting started link: <a href='https://linkToYourDocumentation'>GETTING STARTED</a><hr>"  >>  email/body.html
+              printf "${PKS_CLUSTER_NAME} successfully built" > email/subject.txt
+              printf "</table></body></html>" >> email/body.html
+            else
+              echo "clusterName already used"
+              printf "The name of your requested cluster is already in use" > email/subject.txt
+          #Begin the Email Body
+          cat > email/body.html <<EOH
+          <html>
+          <style>
+          table, th, td {
+              border: 1px solid black;
+          }
+          </style>
+          <body>
+          <p>
+          <pre>
+          EOH
+              printf "${PKS_REQUESTER}, it saddens me to report your cluster name ${PKS_CLUSTER_NAME} is already in use."  >  email/body.html
+            fi
+          done
+          pks logout
+    on_success:
+      put: send-an-email
+      params:
+        headers: email/headers.txt
+        subject: email/subject.txt
+        body: email/body.html
+        to: email/to.txt
+    on_failure:
+      put: send-an-email
+      params:
+        headers: email/headers.txt
+        subject: email/subject.txt
+        body: email/body.html
+        to: email/to.txt
